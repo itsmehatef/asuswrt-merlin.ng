@@ -1477,7 +1477,7 @@ endif
 # install before samba3 for not overwriting some binaries
 obj-$(RTCONFIG_WEBDAV) += samba-3.5.8
 ifeq ($(RTCONFIG_SAMBA4),y)
-obj-$(RTCONFIG_SAMBA4) += samba-4.0.24
+obj-$(RTCONFIG_SAMBA4) += samba4-tm
 else
 obj-$(RTCONFIG_SAMBASRV) += samba-3.6.x_opwrt
 endif

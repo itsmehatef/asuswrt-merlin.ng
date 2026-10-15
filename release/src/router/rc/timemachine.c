@@ -24,6 +24,9 @@
  *
  */
 #include <rc.h>
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+#include <smb_timemachine.h>
+#endif
 #include <stdlib.h>
 #include <bcmnvram.h>
 #include <shutils.h>
@@ -463,8 +466,60 @@ void clear_timemachine_tokeninfo()
 	fclose(fp);
 }
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+int prepare_timemachine_smb(void)
+{
+	char mount[PATH_MAX], backup[PATH_MAX], marker[PATH_MAX];
+	int fd, n;
+	if (smb_tm_ready(mount, sizeof(mount), backup, sizeof(backup)))
+		return 0;
+	if (!smb_tm_paths(mount, sizeof(mount), backup, sizeof(backup)))
+		return -1;
+	/* Never claim an existing folder or follow a symlink on a user's disk. */
+	if (mkdir(backup, 0700) != 0) {
+		logmessage("Timemachine", "backup folder already exists without an ownership marker, or cannot be created");
+		return -1;
+	}
+	n = snprintf(marker, sizeof(marker), "%s/%s", backup, SMB_TM_MARKER);
+	if (n < 0 || (size_t)n >= sizeof(marker)) {
+		rmdir(backup);
+		return -1;
+	}
+	fd = open(marker, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600);
+	if (fd < 0) {
+		rmdir(backup);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+#endif
+
 int start_timemachine()
 {
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	char mount[PATH_MAX], backup[PATH_MAX];
+	if (getpid() != 1) {
+		notify_rc("start_timemachine");
+		return 0;
+	}
+	unlink(SMB_TM_INHIBIT);
+	/* The old AFP service must not access the SMB backup destination. */
+	stop_afpd(1);
+	stop_cnid_metad(1);
+	if (pids("smbd") || pids("nmbd"))
+		stop_samba(1);
+	start_samba();
+	nvram_set("tm_ui_setting", "0");
+	if (!nvram_match("timemachine_enable", "1"))
+		return 0;
+	if (!smb_tm_ready(mount, sizeof(mount), backup, sizeof(backup)) || !smb_tm_configured(backup)) {
+		logmessage("Timemachine", "SMB backup unavailable: enable Samba and select a mounted writable disk with a usable backup folder");
+		return -1;
+	}
+	logmessage("Timemachine", "SMB backup share is configured");
+	return 0;
+#else
 	int ret = 0;
 	char cnid_path[80];
 	char backup_path[80];
@@ -589,10 +644,27 @@ int start_timemachine()
 	logmessage("Timemachine", "daemon is started");
 
 	return ret;
+#endif
 }
 
 void stop_timemachine(int force)
 {
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	int fd;
+	if (!force && getpid() != 1) {
+		notify_rc("stop_timemachine");
+		return;
+	}
+	fd = open(SMB_TM_INHIBIT, O_CREAT | O_WRONLY, 0600);
+	if (fd >= 0)
+		close(fd);
+	/* Keep normal USB shares running when just Time Machine is stopped.
+	 * stop_nas_services has already stopped Samba, so it stays stopped. */
+	if (pids("smbd") || pids("nmbd")) {
+		stop_samba(1);
+		start_samba();
+	}
+#endif
 	stop_afpd(force);
 	stop_cnid_metad(force);
 	restart_mdns();
