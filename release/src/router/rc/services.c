@@ -19,6 +19,9 @@
  */
 
 #include <rc.h>
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+#include <smb_timemachine.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7805,6 +7808,7 @@ void stop_lltd(void)
 #define AVAHI_CONFIG_FN		"avahi-daemon.conf"
 #define AVAHI_AFPD_SERVICE_FN	"afpd.service"
 #define AVAHI_ADISK_SERVICE_FN	"adisk.service"
+#define AVAHI_SMB_SERVICE_FN "smb.service"
 #define AVAHI_ITUNE_SERVICE_FN  "mt-daap.service"
 #if defined(RTCONFIG_ALEXA)
 #define AVAHI_ALEXA_SERVICE_FN  "alexa.service"
@@ -7932,7 +7936,12 @@ int generate_adisk_service_config(void)
 	fprintf(fp, "<service>\n");
 	fprintf(fp, "<type>_adisk._tcp</type>\n");
 	fprintf(fp, "<port>9</port>\n");
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	fprintf(fp, "<txt-record>sys=waMa=0,adVF=0x100</txt-record>\n");
+	fprintf(fp, "<txt-record>dk0=adVN=%s,adVF=0x82</txt-record>\n", SMB_TM_SHARE);
+#else
 	fprintf(fp, "<txt-record>dk0=adVN=%s,adVF=0x81</txt-record>\n", TIMEMACHINE_BACKUP_NAME);
+#endif
 	fprintf(fp, "</service>\n");
 	fprintf(fp, "</service-group>\n");
 
@@ -8011,6 +8020,30 @@ int generate_alexa_config(void)
 }
 #endif
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+static void refresh_smb_mdns(void)
+{
+	char mount[PATH_MAX], backup[PATH_MAX];
+	FILE *fp;
+	unlink(AVAHI_SERVICES_PATH "/" AVAHI_AFPD_SERVICE_FN);
+	if (pids("smbd") && nvram_match("enable_samba", "1")) {
+		fp = fopen(AVAHI_SERVICES_PATH "/" AVAHI_SMB_SERVICE_FN, "w");
+		if (fp) {
+			fprintf(fp, "<service-group>\n<name replace-wildcards=\"yes\">%%h</name>\n"
+			        "<service><type>_smb._tcp</type><port>445</port></service>\n</service-group>\n");
+			fclose(fp);
+		}
+	} else {
+		unlink(AVAHI_SERVICES_PATH "/" AVAHI_SMB_SERVICE_FN);
+	}
+	if (pids("smbd") && smb_tm_ready(mount, sizeof(mount), backup, sizeof(backup)) &&
+	    smb_tm_configured(backup))
+		generate_adisk_service_config();
+	else
+		unlink(AVAHI_SERVICES_PATH "/" AVAHI_ADISK_SERVICE_FN);
+}
+#endif
+
 int start_mdns(void)
 {
 	char afpd_service_config[80];
@@ -8045,6 +8078,9 @@ int start_mdns(void)
 	generate_alexa_config();
 #endif
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	refresh_smb_mdns();
+#else
 	if (pids("afpd") && nvram_match("timemachine_enable", "1"))
 	{
 		if (!f_exists(afpd_service_config))
@@ -8059,6 +8095,8 @@ int start_mdns(void)
 			unlink(adisk_service_config);
 		}
 	}
+
+#endif
 
 	if(nvram_match("daapd_enable", "1") && pids("mt-daapd")){
 		if (!f_exists(itune_service_config)){
@@ -8104,6 +8142,20 @@ void restart_mdns(void)
 	if (g_reboot || g_upgrade)
 		return;
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	mkdir_if_none(AVAHI_CONFIG_PATH);
+	mkdir_if_none(AVAHI_SERVICES_PATH);
+	refresh_smb_mdns();
+	if (nvram_match("daapd_enable", "1") && pids("mt-daapd"))
+		generate_itune_service_config();
+	else
+		unlink(itune_service_config);
+	/* Avahi watches its services directory and reloads changed records. */
+	if (pids("avahi-daemon"))
+		return;
+	start_mdns();
+	return;
+#endif
 	if (nvram_match("timemachine_enable", "1") == f_exists(afpd_service_config)){
 		if(nvram_match("daapd_enable", "1") == f_exists(itune_service_config)){
 			unlink(itune_service_config);
@@ -20099,8 +20151,15 @@ retry_wps_enr:
 #ifdef RTCONFIG_TIMEMACHINE
 	else if (strcmp(script, "timemachine") == 0)
 	{
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+		if (action & RC_SERVICE_START)
+			start_timemachine();
+		else if (action & RC_SERVICE_STOP)
+			stop_timemachine(0);
+#else
 		if(action & RC_SERVICE_STOP) stop_timemachine(0);
 		if(action & RC_SERVICE_START) start_timemachine();
+#endif
 	}
 	else if (strcmp(script, "afpd") == 0)
 	{

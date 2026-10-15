@@ -1,0 +1,6 @@
+cffi==1.17.1
+cryptography==47.0.0
+pycparser==2.23
+pyspnego==0.11.2
+smbprotocol==1.15.0
+typing-extensions==4.13.2

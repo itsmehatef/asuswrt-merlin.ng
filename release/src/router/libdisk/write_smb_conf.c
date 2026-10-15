@@ -27,6 +27,9 @@
 #include <bcmnvram.h>
 #include <shutils.h>
 #include <shared.h>
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+#include <smb_timemachine.h>
+#endif
 #ifdef RTCONFIG_WIREGUARD
 #include <vpn_utils.h>
 #include <network_utility.h>
@@ -105,29 +108,73 @@ is_valid_netbios_name(const char *name)
 	return valid;
 }
 
-int check_existed_share(const char *string)
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+/* Samba resolves share roots before applying veto files, so name matching
+ * alone cannot exclude an alias to a managed backup or one of its children.
+ * Walk the resolved ancestors to cover other disks and disabled backups too. */
+static int smb_share_root_is_managed_backup(const char *mount, const char *folder)
 {
-	FILE *tp;
-	char buf[PATH_MAX], target[256];
+	char path[PATH_MAX], resolved[PATH_MAX], *slash;
+	int n = snprintf(path, sizeof(path), "%s/%s", mount, folder);
 
-	if((tp = fopen(SAMBA_CONF, "r")) == NULL)
+	if (n < 0 || (size_t)n >= sizeof(path))
+		return 1;
+	if (!realpath(path, resolved))
 		return 0;
-
-	if(string == NULL || strlen(string) <= 0)
-		return 0;
-
-	snprintf(target, sizeof(target), "[%s]", string);
-
-	memset(buf, 0, sizeof(buf));
-	while(fgets(buf, sizeof(buf), tp) != NULL){
-		if(strstr(buf, target)){
-			fclose(tp);
+	for (;;) {
+		if (smb_tm_managed_folder(resolved))
 			return 1;
+		slash = strrchr(resolved, '/');
+		if (slash == NULL || slash == resolved)
+			break;
+		*slash = '\0';
+	}
+	return 0;
+}
+
+static int smb_share_name_used(const char *name)
+{
+	FILE *fp;
+	char line[PATH_MAX + 4], target[PATH_MAX + 4];
+	int used = 0;
+	snprintf(target, sizeof(target), "[%s]", name);
+	if (!(fp = fopen(SAMBA_CONF, "r")))
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		if (!strcasecmp(line, target)) {
+			used = 1;
+			break;
 		}
 	}
+	fclose(fp);
+	return used;
+}
+#endif
 
-	fclose(tp);
-	return 0;
+static void write_smb_share_name(FILE *fp, const char *name, const char *mount)
+{
+	char requested[PATH_MAX];
+	if (mount)
+		snprintf(requested, sizeof(requested), "%s (at %s)", name, mount);
+	else
+		snprintf(requested, sizeof(requested), "%s", name);
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	{
+		char candidate[PATH_MAX];
+		unsigned int suffix = 0;
+		snprintf(candidate, sizeof(candidate), "%s", requested);
+		fflush(fp);
+		/* Reserve the advertised backup name, including case variants, and
+		 * retain ordinary shares under a distinct name when names collide. */
+		while (!strcasecmp(candidate, SMB_TM_SHARE) || smb_share_name_used(candidate))
+			snprintf(candidate, sizeof(candidate), "%.*s (files %u)",
+			         (int)sizeof(candidate) - 32, requested, ++suffix);
+		fprintf(fp, "[%s]\n", candidate);
+	}
+#else
+	fprintf(fp, "[%s]\n", requested);
+#endif
 }
 
 int get_list_strings_count(char **list, int size, char *str)
@@ -288,6 +335,11 @@ int main(int argc, char *argv[])
 	int dup, same_m_pt = 0;
 	char unique_share_name[PATH_MAX];
 	int st_samba_mode = nvram_get_int("st_samba_mode");
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	char tm_mount[PATH_MAX], tm_backup[PATH_MAX];
+	int tm_globals_ready = 0;
+	int tm_ready = smb_tm_ready(tm_mount, sizeof(tm_mount), tm_backup, sizeof(tm_backup));
+#endif
 #if !defined(RTCONFIG_TUXERA_SMBD)
 	int spnego = 0;
 #ifdef RTCONFIG_WIREGUARD
@@ -358,7 +410,9 @@ int main(int argc, char *argv[])
 	fprintf(fp, "smb passwd file = /etc/samba/smbpasswd\n");
 #endif
 //#if defined(RTCONFIG_SAMBA36X)
+#if !defined(RTCONFIG_SAMBA4)
 	fprintf(fp, "username level = 20\n");
+#endif
 #endif
 
 #if defined(RTCONFIG_TUXERA_SMBD)
@@ -407,6 +461,9 @@ int main(int argc, char *argv[])
 
 	// account mode
 	if(st_samba_mode == 2 || st_samba_mode == 4
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+			|| (tm_ready && (st_samba_mode < 1 || st_samba_mode > 4))
+#endif
 			|| (st_samba_mode == 1 && nvram_get("st_samba_force_mode") == NULL)
 			){
 		fprintf(fp, "security = USER\n");
@@ -417,7 +474,11 @@ int main(int argc, char *argv[])
 	else if(st_samba_mode == 1 || st_samba_mode == 3){
 //#if defined(RTCONFIG_SAMBA3) && defined(RTCONFIG_SAMBA36X)
 #if defined(RTCONFIG_SAMBA36X) || defined(RTCONFIG_SAMBA4)
+#if !defined(RTCONFIG_SAMBA4)
 		fprintf(fp, "auth methods = guest\n");
+#else
+		fprintf(fp, "security = USER\n");
+#endif
 		fprintf(fp, "guest account = %s\n", nvram_get("http_username")? : "admin");
 		fprintf(fp, "map to guest = Bad Password\n");
 		fprintf(fp, "guest ok = yes\n");
@@ -431,9 +492,15 @@ int main(int argc, char *argv[])
 		goto confpage;
 	}
 
+#if !defined(RTCONFIG_SAMBA4)
 	fprintf(fp, "encrypt passwords = yes\n");
+#endif
 	fprintf(fp, "pam password change = no\n");
-	fprintf(fp, "null passwords = yes\n");		// ASUS add
+#if defined(RTCONFIG_SAMBA4)
+	fprintf(fp, "null passwords = no\n");
+#else
+	fprintf(fp, "null passwords = yes\n");
+#endif		// ASUS add
 
 	fprintf(fp, "force directory mode = 0777\n");
 	fprintf(fp, "force create mode = 0777\n");
@@ -469,8 +536,10 @@ int main(int argc, char *argv[])
 #endif
 	}
 	fprintf(fp, "obey pam restrictions = no\n");
-	fprintf(fp, "use spnego = %s\n", spnego? "yes" : "no");		// ASUS add
-	fprintf(fp, "client use spnego = no\n");	// ASUS add
+#if !defined(RTCONFIG_SAMBA4)
+	fprintf(fp, "use spnego = %s\n", spnego? "yes" : "no");
+	fprintf(fp, "client use spnego = no\n");
+#endif
 //	fprintf(fp, "client use spnego = yes\n");	// ASUS add
 	fprintf(fp, "disable spoolss = yes\n");		// ASUS add
 	fprintf(fp, "host msdfs = no\n");		// ASUS add
@@ -632,6 +701,36 @@ int main(int argc, char *argv[])
 	fprintf(fp, "smb passwd file = /etc/samba/smbpasswd\n");
 #endif
 
+#ifdef RTCONFIG_SAMBA4
+	fprintf(fp, "server role = standalone server\n");
+	fprintf(fp, "passdb backend = smbpasswd\n");
+	fprintf(fp, "smb passwd file = /etc/samba/smbpasswd\n");
+	fprintf(fp, "private dir = /etc/samba/private\n");
+	fprintf(fp, "state directory = /var/lock/samba\n");
+	fprintf(fp, "cache directory = /var/lock/samba\n");
+	fprintf(fp, "lock directory = /var/lock/samba\n");
+	fprintf(fp, "pid directory = /var/run/samba\n");
+	/* Time Machine needs SMB2+, irrespective of the old SMB1-only selector. */
+	if (nvram_match("timemachine_enable", "1")) {
+		fprintf(fp, "server min protocol = SMB2_02\n");
+		fprintf(fp, "server max protocol = SMB3\n");
+	} else {
+		fprintf(fp, "server min protocol = %s\n", nvram_get_int("smbd_protocol") == 1 ? "SMB2_02" : "NT1");
+		fprintf(fp, "server max protocol = %s\n", nvram_get_int("smbd_protocol") == 0 ? "NT1" : "SMB3");
+	}
+#ifdef RTCONFIG_TIMEMACHINE
+	fprintf(fp, "vfs objects = catia fruit streams_xattr\n");
+	fprintf(fp, "fruit:aapl = yes\n");
+	/* Default backend supports native encoding and metadata write-through. */
+	fprintf(fp, "fruit:metadata = netatalk\n");
+	fprintf(fp, "fruit:resource = file\n");
+	fprintf(fp, "fruit:encoding = native\n");
+	/* Existing Avahi provides discovery; do not publish a second copy. */
+	fprintf(fp, "multicast dns register = no\n");
+	tm_globals_ready = 1;
+#endif
+#endif
+
 	/* share */
 	if(st_samba_mode == 0){
 		;
@@ -690,12 +789,21 @@ int main(int argc, char *argv[])
 				fprintf(fp, "permissions = guest:full,everyone:full\n");
 				fprintf(fp, "[/share]\n");
 #else
-				fprintf(fp, "[%s]\n", mount_folder);
+				write_smb_share_name(fp, mount_folder, NULL);
 				fprintf(fp, "comment = %s's %s\n", follow_disk->tag, mount_folder);
 #ifdef RTCONFIG_USB_CDROM
 				if(!is_cdrom_name(follow_partition->device))
 #endif
-				fprintf(fp, "veto files = /.__*.txt*/asusware*/asus_lighttpdpasswd/\n");
+				fprintf(fp, "veto files = /.__*.txt*/asusware*/asus_lighttpdpasswd/"
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+				        "%s"
+#endif
+				        "\n"
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+				        , smb_tm_protected_mount(follow_partition->mount_point) ? SMB_TM_FOLDER "/" : ""
+#endif
+				);
+
 				fprintf(fp, "path = %s\n", follow_partition->mount_point);
 				fprintf(fp, "writeable = %s\n", strcmp(follow_partition->permission, "rw") == 0 ? "yes" : "no");
 				fprintf(fp, "dos filetimes = yes\n");
@@ -723,7 +831,7 @@ int main(int argc, char *argv[])
 
 				int node_layer = get_permission(NULL, follow_partition->mount_point, NULL, "cifs", 0);
 				if(node_layer == 3){
-					fprintf(fp, "[%s]\n", mount_folder);
+					write_smb_share_name(fp, mount_folder, NULL);
 					fprintf(fp, "comment = %s's %s\n", follow_disk->tag, mount_folder);
 					fprintf(fp, "path = %s\n", follow_partition->mount_point);
 					fprintf(fp, "writeable = %s\n", strcmp(follow_partition->permission, "rw") == 0 ? "yes" : "no");
@@ -754,9 +862,9 @@ int main(int argc, char *argv[])
 						if(samba_right > 0){
 							int count = get_list_strings_count(folder_list, sh_num, folder_list[n]);
 							if ((!strcmp(nvram_safe_get("smbd_simpler_naming"), "1")) && (count <= 1))
-								fprintf(fp, "[%s]\n", folder_list[n]);
+								write_smb_share_name(fp, folder_list[n], NULL);
 							else
-								fprintf(fp, "[%s (at %s)]\n", folder_list[n], mount_folder);
+								write_smb_share_name(fp, folder_list[n], mount_folder);
 							fprintf(fp, "comment = %s's %s in %s\n", mount_folder, folder_list[n], follow_disk->tag);
 							fprintf(fp, "path = %s/%s\n", follow_partition->mount_point, folder_list[n]);
 							if(samba_right == 3 && strcmp(follow_partition->permission, "rw") == 0)
@@ -807,16 +915,16 @@ int main(int argc, char *argv[])
 					int i, first;
 
 					if(n == -1){
-						fprintf(fp, "[%s]\n", mount_folder);
+						write_smb_share_name(fp, mount_folder, NULL);
 						fprintf(fp, "comment = %s's %s\n", follow_disk->tag, mount_folder);
 						fprintf(fp, "path = %s\n", follow_partition->mount_point);
 					}
 					else{
 						int count = get_list_strings_count(folder_list, sh_num, folder_list[n]);
 						if ((!strcmp(nvram_safe_get("smbd_simpler_naming"), "1")) && (count <= 1))
-							fprintf(fp, "[%s]\n", folder_list[n]);
+							write_smb_share_name(fp, folder_list[n], NULL);
 						else
-							fprintf(fp, "[%s (at %s)]\n", folder_list[n], mount_folder);
+							write_smb_share_name(fp, folder_list[n], mount_folder);
 						fprintf(fp, "comment = %s's %s in %s\n", mount_folder, folder_list[n], follow_disk->tag);
 						fprintf(fp, "path = %s/%s\n", follow_partition->mount_point, folder_list[n]);
 					}
@@ -947,7 +1055,7 @@ int main(int argc, char *argv[])
 					} while(dup);
 					mount_folder = strrchr(unique_share_name, '/')+1;
 
-					fprintf(fp, "[%s]\n", mount_folder);
+					write_smb_share_name(fp, mount_folder, NULL);
 					fprintf(fp, "comment = %s's %s\n", follow_disk->tag, mount_folder);
 					fprintf(fp, "path = %s\n", follow_partition->mount_point);
 					fprintf(fp, "writeable = %s\n", strcmp(follow_partition->permission, "rw") == 0 ? "yes" : "no");
@@ -1025,6 +1133,11 @@ int main(int argc, char *argv[])
 				// 2. start to get every share
 				for(n = 0; n < sh_num; ++n){
 					int count = get_list_strings_count(folder_list, sh_num, folder_list[n]);
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+					if (smb_share_root_is_managed_backup(follow_partition->mount_point,
+					                                    folder_list[n]))
+						continue;
+#endif
 
 #if defined(RTCONFIG_TUXERA_SMBD)
 					fprintf(fp, "[share]\n");
@@ -1060,9 +1173,9 @@ int main(int argc, char *argv[])
 					fprintf(fp, "[/share]\n");
 #else // RTCONFIG_TUXERA_SMBD
 					if ((!strcmp(nvram_safe_get("smbd_simpler_naming"), "1")) && (count <= 1))
-						fprintf(fp, "[%s]\n", folder_list[n]);
+						write_smb_share_name(fp, folder_list[n], NULL);
 					else
-						fprintf(fp, "[%s (at %s)]\n", folder_list[n], mount_folder);
+						write_smb_share_name(fp, folder_list[n], mount_folder);
 					fprintf(fp, "comment = %s's %s in %s\n", mount_folder, folder_list[n], follow_disk->tag);
 					fprintf(fp, "path = %s/%s\n", follow_partition->mount_point, folder_list[n]);
 
@@ -1292,6 +1405,27 @@ int main(int argc, char *argv[])
 
 confpage:
 	if(fp != NULL) {
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+		if (tm_ready && tm_globals_ready) {
+			unsigned long long mib;
+			char *end;
+			const char *limit = nvram_safe_get("tm_vol_size");
+			fprintf(fp, "\n[%s]\n", SMB_TM_SHARE);
+			fprintf(fp, "comment = Time Machine backups\n");
+			fprintf(fp, "path = %s\n", tm_backup);
+			fprintf(fp, "browseable = yes\nread only = no\nguest ok = no\nguest only = no\n");
+			fprintf(fp, "valid users = \"%s\"\n", nvram_safe_get("http_username"));
+			fprintf(fp, "invalid users = \nread list = \nwrite list = \n");
+			fprintf(fp, "create mask = 0600\ndirectory mask = 0700\nforce create mode = 0600\nforce directory mode = 0700\n");
+			fprintf(fp, "veto files = /%s/\n", SMB_TM_MARKER);
+			/* Keep DOS metadata on new backup files for Tuxera xattr enumeration. */
+			fprintf(fp, "store dos attributes = yes\n");
+			fprintf(fp, "fruit:time machine = yes\n");
+			mib = strtoull(limit, &end, 10);
+			if (*limit && !*end && mib > 0 && mib <= 99999999ULL)
+				fprintf(fp, "fruit:time machine max size = %lluM\n", mib);
+		}
+#endif
 
 		append_custom_config("smb.conf", fp);
 		fclose(fp);

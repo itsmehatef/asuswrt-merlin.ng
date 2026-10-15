@@ -5,6 +5,12 @@
 */
 
 #include <rc.h>
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+#include <smb_timemachine.h>
+#endif
+#ifdef RTCONFIG_SAMBA4
+#include <sys/wait.h>
+#endif
 
 #ifdef RTCONFIG_PERMISSION_MANAGEMENT
 #include <PMS_DBAPIs.h>
@@ -3303,6 +3309,64 @@ void create_custom_passwd(void)
 }
 #endif
 
+#ifdef RTCONFIG_SAMBA4
+static int samba4_rpc_group_wait(pid_t group, unsigned int attempts)
+{
+	unsigned int i;
+	int status;
+	for (i = 0; i < attempts; ++i) {
+		/* PID 1 also reaps workers orphaned when their host exits. */
+		while (waitpid(-group, &status, WNOHANG) > 0)
+			;
+		if (kill(-group, 0) < 0 && errno == ESRCH)
+			return 0;
+		usleep(100000);
+	}
+	return -1;
+}
+
+static int samba4_stop_rpc(void)
+{
+	FILE *fp;
+	long value;
+	pid_t pid, group;
+	char path[64], executable[PATH_MAX];
+	ssize_t length;
+	int parsed;
+
+	fp = fopen("/var/run/samba/samba-dcerpcd.pid", "r");
+	if (!fp)
+		return errno == ENOENT ? 0 : -1;
+	parsed = fscanf(fp, "%ld", &value);
+	fclose(fp);
+	if (parsed != 1 || value <= 1 || value > INT_MAX)
+		return -1;
+	pid = (pid_t)value;
+	snprintf(path, sizeof(path), "/proc/%ld/exe", value);
+	length = readlink(path, executable, sizeof(executable) - 1);
+	if (length < 0)
+		return errno == ENOENT ? 0 : -1;
+	executable[length] = '\0';
+	/* The on-demand RPC host calls setsid(). Verify both its executable and
+	 * its isolated process group before signalling it and its own workers. */
+	if (strcmp(executable, "/usr/lib/tm-samba/libexec/samba/samba-dcerpcd"))
+		return -1;
+	group = getpgid(pid);
+	if (group < 0)
+		return errno == ESRCH ? 0 : -1;
+	if (group != pid)
+		return -1;
+	if (kill(-pid, SIGTERM) < 0)
+		return errno == ESRCH ? 0 : -1;
+	if (samba4_rpc_group_wait(pid, 30) == 0)
+		return 0;
+	/* A stuck RPC worker must not retain an unlinked live pidfile/socket. */
+	if (kill(-pid, SIGKILL) < 0 && errno != ESRCH)
+		return -1;
+	return samba4_rpc_group_wait(pid, 10);
+}
+#endif
+
 static void kill_samba(int sig)
 {
 #if defined(RTCONFIG_TUXERA_SMBD)
@@ -3395,6 +3459,68 @@ start_write_smb_conf(void)
 	system("/sbin/write_smb_conf");
 }
 
+#ifdef RTCONFIG_SAMBA4
+static int samba4_add_password(const char *user, const char *password)
+{
+	FILE *input;
+	pid_t pid, waited;
+	int status, result = -1;
+	sigset_t child_set, saved_mask;
+	struct sigaction saved_chld, default_chld;
+	if (!user || !*user || user[0] == '-' || !password || strpbrk(password, "\r\n"))
+		return -1;
+	input = tmpfile();
+	if (!input)
+		return -1;
+	if (fchmod(fileno(input), 0600) != 0) {
+		fclose(input);
+		return -1;
+	}
+	if (fprintf(input, "%s\n%s\n", password, password) < 0 || fflush(input)) {
+		fclose(input);
+		return -1;
+	}
+	rewind(input);
+	/* PID 1's SIGCHLD handler reaps every child. As in _eval(), prevent it
+	 * (or an inherited SIG_IGN) from consuming this command's exit status. */
+	sigemptyset(&child_set);
+	sigaddset(&child_set, SIGCHLD);
+	if (sigprocmask(SIG_BLOCK, &child_set, &saved_mask) < 0) {
+		fclose(input);
+		return -1;
+	}
+	memset(&default_chld, 0, sizeof(default_chld));
+	default_chld.sa_handler = SIG_DFL;
+	sigemptyset(&default_chld.sa_mask);
+	if (sigaction(SIGCHLD, &default_chld, &saved_chld) < 0) {
+		sigprocmask(SIG_SETMASK, &saved_mask, NULL);
+		fclose(input);
+		return -1;
+	}
+	pid = fork();
+	if (pid == 0) {
+		if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) < 0 ||
+		    dup2(fileno(input), STDIN_FILENO) < 0)
+			_exit(127);
+		execl("/usr/sbin/smbpasswd", "smbpasswd", "-c", "/etc/smb.conf",
+		      "-s", "-a", user, (char *)NULL);
+		_exit(127);
+	}
+	if (pid > 0) {
+		do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+		if (waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+			result = 0;
+	}
+	/* Restore the handler before delivering any pending SIGCHLD. */
+	if (sigaction(SIGCHLD, &saved_chld, NULL) < 0)
+		result = -1;
+	if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) < 0)
+		result = -1;
+	fclose(input);
+	return result;
+}
+#endif
+
 void
 start_samba(void)
 {
@@ -3454,6 +3580,19 @@ start_samba(void)
 #endif
 
 	mkdir_if_none("/etc/samba");
+#ifdef RTCONFIG_SAMBA4
+	mkdir_if_none("/var/run/samba");
+	mkdir_if_none("/var/lock/samba");
+	mkdir_if_none("/etc/samba/private");
+	chmod("/etc/samba/private", 0700);
+#ifdef RTCONFIG_TIMEMACHINE
+	if (nvram_match("timemachine_enable", "1")) {
+		stop_afpd(1);
+		stop_cnid_metad(1);
+	}
+	prepare_timemachine_smb();
+#endif
+#endif
 
 	unlink("/etc/smb.conf");
 	unlink("/etc/samba/smbpasswd");
@@ -3473,7 +3612,7 @@ start_samba(void)
 	//system("echo -e \"\n\n\" |/usr/sbin/smbpasswd -s -a nobody");
 	system("/usr/sbin/smbpasswd nobody \"\"");
 #elif defined(RTCONFIG_SAMBA4)
-	system("echo -e \"\n\n\" |/usr/sbin/smbpasswd -s -a nobody");
+	/* Guest access does not require an enabled blank-password account. */
 #else
 	system("smbpasswd nobody \"\"");
 #endif
@@ -3510,7 +3649,9 @@ start_samba(void)
 		//snprintf(cmd, sizeof(cmd), "echo -e \"%s\n%s\n\"  |/usr/sbin/smbpasswd -s -a \"%s\"", suit_passwd, suit_passwd, suit_user);
 		snprintf(cmd, sizeof(cmd), "/usr/sbin/smbpasswd \"%s\" \"%s\"", suit_user, suit_passwd);
 #elif defined(RTCONFIG_SAMBA4)
-		snprintf(cmd, sizeof(cmd), "echo -e \"%s\n%s\n\"  |/usr/sbin/smbpasswd -s -a \"%s\"", suit_passwd, suit_passwd, suit_user);
+		if (samba4_add_password(char_user, char_passwd))
+			logmessage("Samba Server", "could not import a USB account");
+		continue;
 #else
 		snprintf(cmd, sizeof(cmd), "smbpasswd \"%s\" \"%s\"", suit_user, suit_passwd);
 #endif
@@ -3565,7 +3706,11 @@ start_samba(void)
 			//snprintf(cmd, sizeof(cmd), "echo -e \"%s\n%s\n\"  |/usr/sbin/smbpasswd -s -a \"%s\"", suit_passwd, suit_passwd, suit_user);
 			snprintf(cmd, sizeof(cmd), "/usr/sbin/smbpasswd \"%s\" \"%s\"", suit_user, suit_passwd);
 #elif defined(RTCONFIG_SAMBA4)
-			snprintf(cmd, sizeof(cmd), "echo -e \"%s\n%s\n\"  |/usr/sbin/smbpasswd -s -a \"%s\"", suit_passwd, suit_passwd, suit_user);
+			if (samba4_add_password(char_user, char_passwd))
+				logmessage("Samba Server", "could not import a USB account");
+			if (++i >= acc_num)
+				break;
+			continue;
 #else
 			snprintf(cmd, sizeof(cmd), "smbpasswd \"%s\" \"%s\"", suit_user, suit_passwd);
 #endif
@@ -3587,7 +3732,11 @@ start_samba(void)
 #elif defined(RTCONFIG_SAMBA36X) || defined(RTCONFIG_SAMBA4)
 	mkdir_if_none("/var/run/samba");
 
+#ifdef RTCONFIG_SAMBA4
+	eval("/usr/sbin/nmbd", "-D", "-s", "/etc/smb.conf");
+#else
 	xstart("/usr/sbin/nmbd", "-D", "-s", "/etc/smb.conf");
+#endif
 	snprintf(smbd_cmd, sizeof(smbd_cmd), "%s/smbd", "/usr/sbin");
 #else
 	xstart("nmbd", "-D", "-s", "/etc/smb.conf");
@@ -3596,6 +3745,11 @@ start_samba(void)
 #endif
 
 #if !defined(RTCONFIG_TUXERA_SMBD)
+#ifdef RTCONFIG_SAMBA4
+	/* Wait for daemon startup before publishing its service records. */
+	if (eval(smbd_cmd, "-D", "-s", "/etc/smb.conf") != 0)
+		logmessage("Samba Server", "SMB daemon failed to start");
+#else
 #if defined(SMP)
 #if defined(RTCONFIG_BCMARM) || defined(RTCONFIG_SOC_IPQ8064) || defined(RTCONFIG_SOC_IPQ8074)
 #if defined(RTCONFIG_HND_ROUTER_AX_675X) || defined(BCM6750) || defined(BCM6756) || defined(BCM6855)
@@ -3631,9 +3785,13 @@ start_samba(void)
 		xstart(smbd_cmd, "-D", "-s", "/etc/smb.conf");
 #endif
 
+#endif /* RTCONFIG_SAMBA4 */
 	start_wsdd();
 #endif // !defined(RTCONFIG_TUXERA_SMBD)
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	restart_mdns();
+#endif
 	logmessage("Samba Server", "daemon is started");
 
 	return;
@@ -3652,8 +3810,18 @@ void stop_samba(int force)
 	unlink("/var/log/smb");
 	unlink("/var/log/nmb");
 
+#ifdef RTCONFIG_SAMBA4
+	if (samba4_stop_rpc() == 0)
+		eval("rm", "-rf", "/var/run/samba");
+	else
+		logmessage("Samba Server", "RPC helper shutdown could not be verified; preserving its runtime directory");
+#else
 	eval("rm", "-rf", "/var/run/samba");
+#endif
 
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	restart_mdns();
+#endif
 	logmessage("Samba Server", "smb daemon is stopped");
 
 #if defined(RTCONFIG_BCMARM) && !defined(RTCONFIG_HND_ROUTER)
@@ -4760,6 +4928,9 @@ void start_nas_services(int force)
 	}
 
 	setup_passwd();
+#if defined(RTCONFIG_SAMBA4) && defined(RTCONFIG_TIMEMACHINE)
+	unlink(SMB_TM_INHIBIT);
+#endif
 #if defined(RTCONFIG_SAMBASRV) || defined(RTCONFIG_TUXERA_SMBD)
 	start_samba();
 #endif
@@ -4782,7 +4953,7 @@ if (nvram_match("asus_mfg", "0")) {
 	//start_webdav();
 #endif
 }
-#ifdef RTCONFIG_TIMEMACHINE
+#if defined(RTCONFIG_TIMEMACHINE) && !defined(RTCONFIG_SAMBA4)
 	start_timemachine();
 #endif
 	char *usbuipath=nvram_safe_get("usbUIpath");

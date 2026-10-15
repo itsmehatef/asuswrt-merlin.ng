@@ -1,0 +1,41 @@
+--- a/source3/lib/adouble.c
++++ b/source3/lib/adouble.c
+@@ -2225,6 +2225,8 @@
+ 	int rc = 0;
+ 	struct adouble *ad = NULL;
+ 	struct smb_filename *adp_smb_fname = NULL;
++	struct smb_filename *ad_parent = NULL;
++	struct smb_filename *ad_atname = NULL;
+ 	struct files_struct *ad_fsp = NULL;
+ 	NTSTATUS status;
+ 	struct vfs_open_how how = { .flags = in_flags, .mode = mode, };
+@@ -2252,10 +2254,27 @@
+ 		how.flags |= O_RDWR;
+ 	}
+ 
+-	status = fd_openat(dirfsp,
+-			   adp_smb_fname,
++	/*
++	 * Open our internal sidecar relative to its checked parent. Passing a
++	 * multi-component name to fd_openat() would apply the client veto to
++	 * the final ._ component. Keep that veto for actual client requests.
++	 */
++	status = parent_pathref(talloc_tos(),
++				discard_const_p(struct files_struct, dirfsp),
++				adp_smb_fname,
++				&ad_parent,
++				&ad_atname);
++	if (!NT_STATUS_IS_OK(status)) {
++		file_free(NULL, ad_fsp);
++		return status;
++	}
++
++	status = fd_openat(ad_parent->fsp,
++			   ad_atname,
+ 			   ad_fsp,
+ 			   &how);
++	/* ad_atname is a talloc child of ad_parent; free both together. */
++	TALLOC_FREE(ad_parent);
+ 	if (!NT_STATUS_IS_OK(status)) {
+ 		file_free(NULL, ad_fsp);
+ 		return status;
