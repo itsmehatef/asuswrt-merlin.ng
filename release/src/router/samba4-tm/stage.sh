@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 umask 022
-TM_ROOT=${TM_ROOT:-/build/tm-samba}
-TC=/opt/toolchains/crosstools-arm-gcc-9.2-linux-4.19-glibc-2.30-binutils-2.32/usr/bin
-export LD_LIBRARY_PATH="${TC%/bin}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+source "$SCRIPT_DIR/build-env.sh"
+tm_cross_environment
 TM_STAGE=$(mktemp -d "$TM_ROOT/stage.new.XXXXXX")
 trap 'rm -rf "$TM_STAGE"' EXIT
 mkdir -p "$TM_STAGE/usr/sbin" "$TM_STAGE/usr/bin" "$TM_STAGE/usr/lib/tm-samba" "$TM_STAGE/usr/share/samba"
@@ -13,11 +13,10 @@ for name in testparm smbclient pdbedit smbpasswd; do install -m755 "$TM_ROOT/ins
 ln -sfn ../bin/smbpasswd "$TM_STAGE/usr/sbin/smbpasswd"
 cp -a "$TM_ROOT/install/usr/lib/tm-samba/." "$TM_STAGE/usr/lib/tm-samba/"
 find "$TM_ROOT/deps/usr/lib/tm-samba" -maxdepth 1 \( -type f -o -type l \) -name '*.so*' -exec cp -a -t "$TM_STAGE/usr/lib/tm-samba" '{}' +
-TM_ATOMIC=$("$TC/arm-buildroot-linux-gnueabi-gcc" -print-file-name=libatomic.so)
+TM_ATOMIC=$("$CC" -print-file-name=libatomic.so)
 install -m755 "$(readlink -f "$TM_ATOMIC")" "$TM_STAGE/usr/lib/tm-samba/libatomic.so.1"
 # The firmware omits glibc converters. Samba's default DOS charset needs IBM850,
 # and its native Unicode conversion needs UTF-16; use the matching vendor libc modules.
-TM_SYSROOT=$("$TC/arm-buildroot-linux-gnueabi-gcc" -print-sysroot)
 mkdir -p "$TM_STAGE/usr/lib/gconv"
 for module in IBM850 UTF-16; do
  install -m755 "$TM_SYSROOT/usr/lib/gconv/$module.so" "$TM_STAGE/usr/lib/gconv/$module.so"
@@ -59,7 +58,7 @@ while IFS= read -r -d '' file; do
   if [[ "$new_rpath" != "$old_rpath" ]]; then
    patchelf --force-rpath --set-rpath "$new_rpath" "$file"
   fi
-  "$TC/arm-buildroot-linux-gnueabi-strip" --strip-unneeded "$file"
+  "$STRIP" --strip-unneeded "$file"
  fi
 done < <(find "$TM_STAGE" -type f -print0)
 # Do not inherit permissive build modes or mktemp's private root mode into firmware.

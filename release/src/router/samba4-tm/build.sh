@@ -1,8 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
-export TM_ROOT=${TM_ROOT:-"$SCRIPT_DIR/.build"}
-export TM_JOBS=${TM_JOBS:-6}
+source "$SCRIPT_DIR/build-env.sh"
 mkdir -p "$TM_ROOT"
 if [[ ${TM_BUILD_LOCKED:-0} != 1 ]]; then
  exec 9>"$TM_ROOT/build.lock"
@@ -32,8 +31,9 @@ case "${1:-all}" in
  all) ;;
  *) echo 'usage: build.sh {all|install DESTDIR|clean}' >&2; exit 2;;
 esac
-mkdir -p "$TM_ROOT/downloads" "$TM_ROOT/src" "$TM_ROOT/stamps" /build/logs/time-machine
-python3 "$SCRIPT_DIR/download.py" > /build/logs/time-machine/download.log 2>&1
+tm_cross_environment
+mkdir -p "$TM_ROOT/downloads" "$TM_ROOT/src" "$TM_ROOT/stamps" "$TM_LOG_DIR"
+python3 "$SCRIPT_DIR/download.py" > "$TM_LOG_DIR/download.log" 2>&1
 for arc in "$TM_ROOT"/downloads/*.tar.gz "$TM_ROOT"/downloads/*.tar.xz; do
  [[ -f "$arc" ]] || continue
  dir=$(basename "$arc" | sed -E 's/\.tar\.(gz|xz)$//')
@@ -53,17 +53,17 @@ case "$(sha256sum "$resource_source" | cut -d' ' -f1)" in
  *) echo 'Refusing unrecognized Samba AppleDouble source' >&2; exit 1;;
 esac
 test "$(sha256sum "$resource_source" | cut -d' ' -f1)" = "$resource_patched"
-bash "$SCRIPT_DIR/build-deps.sh" > /build/logs/time-machine/deps-driver.log 2>&1
-host_hash=$(sha256sum "$SCRIPT_DIR/build-host.sh" | cut -d' ' -f1)
+bash "$SCRIPT_DIR/build-deps.sh" > "$TM_LOG_DIR/deps-driver.log" 2>&1
+host_hash=$(tm_fingerprint host "$SCRIPT_DIR/build-env.sh" "$SCRIPT_DIR/build-host.sh" "$SCRIPT_DIR/download.py" "$SCRIPT_DIR/host-generators.patch")
 if [[ ! -f "$TM_ROOT/stamps/samba-host" ]] || [[ $(cat "$TM_ROOT/stamps/samba-host") != "$host_hash" ]]; then
- bash "$SCRIPT_DIR/build-host.sh" > /build/logs/time-machine/samba-host.log 2>&1
+ bash "$SCRIPT_DIR/build-host.sh" > "$TM_LOG_DIR/samba-host.log" 2>&1
  printf '%s\n' "$host_hash" > "$TM_ROOT/stamps/samba-host"
 fi
-target_hash=$(cat "$SCRIPT_DIR/build.sh" "$SCRIPT_DIR/build-target.sh" "$SCRIPT_DIR/qemu-cross.sh" "$SCRIPT_DIR/stage.sh" "$SCRIPT_DIR/download.py" "$SCRIPT_DIR/build-deps.sh" "$SCRIPT_DIR/build-host.sh" "$SCRIPT_DIR"/*.patch "$TM_ROOT/stamps/samba-host" | sha256sum | cut -d' ' -f1)
+target_hash=$(tm_fingerprint target "$SCRIPT_DIR/build-env.sh" "$SCRIPT_DIR/build.sh" "$SCRIPT_DIR/build-target.sh" "$SCRIPT_DIR/qemu-cross.sh" "$SCRIPT_DIR/stage.sh" "$SCRIPT_DIR/download.py" "$SCRIPT_DIR/build-deps.sh" "$SCRIPT_DIR/build-host.sh" "$SCRIPT_DIR"/*.patch "$TM_ROOT/stamps/samba-host" "$TM_ROOT/stamps/deps-config")
 if [[ ! -f "$TM_ROOT/stamps/samba-target" ]] || [[ $(cat "$TM_ROOT/stamps/samba-target") != "$target_hash" ]]; then
- target_log=/build/logs/time-machine/samba-target-$(date -u +%Y%m%dT%H%M%SZ)-$$.log
- ln -sfn "$(basename "$target_log")" /build/logs/time-machine/samba-target.log
+ target_log="$TM_LOG_DIR/samba-target-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+ ln -sfn "$(basename "$target_log")" "$TM_LOG_DIR/samba-target.log"
  bash "$SCRIPT_DIR/build-target.sh" > "$target_log" 2>&1
- bash "$SCRIPT_DIR/stage.sh" > /build/logs/time-machine/stage.log 2>&1
+ bash "$SCRIPT_DIR/stage.sh" > "$TM_LOG_DIR/stage.log" 2>&1
  printf '%s\n' "$target_hash" > "$TM_ROOT/stamps/samba-target"
 fi

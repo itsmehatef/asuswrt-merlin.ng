@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import concurrent.futures, hashlib, json, os, pathlib, urllib.request
-root = pathlib.Path(os.environ.get('TM_ROOT','/build/tm-samba'))/'downloads'
+root = pathlib.Path(os.environ.get('TM_ROOT', pathlib.Path(__file__).resolve().parent / '.build')).resolve() / 'downloads'
 root.mkdir(parents=True, exist_ok=True)
 items = [
  ('samba-4.24.8.tar.gz','https://download.samba.org/pub/samba/stable/samba-4.24.8.tar.gz','9b6611ab9ae718f47ef0d54008403d7b60a3c6c13e59b2aba769b085caea1d75'),
